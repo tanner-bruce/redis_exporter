@@ -9,20 +9,23 @@ package exporter
 */
 
 import (
+	"bytes"
+	"flag"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
-	"bytes"
-	"flag"
 	"github.com/garyburd/redigo/redis"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	dto "github.com/prometheus/client_model/go"
+	log "github.com/sirupsen/logrus"
 )
 
 const (
@@ -96,23 +99,21 @@ func resetLatency(t *testing.T, addr string) error {
 	return nil
 }
 
-func getMetrics(t *testing.T) []byte {
-	resp, err := http.Get("http://127.0.0.1:9121/metrics")
+func downloadUrl(t *testing.T, url string) []byte {
+	log.Debugf("downloadURL() %s", url)
+	resp, err := http.Get(url)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatal(err)
 	}
-
 	return body
 }
 
 func TestLatencySpike(t *testing.T) {
-
 	e, _ := NewRedisExporter(defaultRedisHost, "test", "")
 
 	setupLatency(t, defaultRedisHost.Addrs[0])
@@ -224,7 +225,6 @@ func deleteKeysFromDB(t *testing.T, addr string) error {
 	}
 
 	c.Do("DEL", TestSetName)
-
 	return nil
 }
 
@@ -568,6 +568,8 @@ func TestCommandStats(t *testing.T) {
 }
 
 func TestHTTPEndpoint(t *testing.T) {
+	ts := httptest.NewServer(promhttp.Handler())
+	defer ts.Close()
 
 	e, _ := NewRedisExporter(defaultRedisHost, "test", dbNumStrFull+"="+url.QueryEscape(keys[0]))
 
@@ -575,7 +577,7 @@ func TestHTTPEndpoint(t *testing.T) {
 	defer deleteKeysFromDB(t, defaultRedisHost.Addrs[0])
 	prometheus.Register(e)
 
-	body := getMetrics(t)
+	body := downloadUrl(t, ts.URL+"/metrics")
 
 	tests := []string{
 		// metrics
@@ -598,12 +600,10 @@ func TestHTTPEndpoint(t *testing.T) {
 }
 
 func TestNonExistingHost(t *testing.T) {
-
 	rr := RedisHost{Addrs: []string{"unix:///tmp/doesnt.exist"}, Aliases: []string{""}}
 	e, _ := NewRedisExporter(rr, "test", "")
 
 	chM := make(chan prometheus.Metric)
-
 	go func() {
 		e.Collect(chM)
 		close(chM)
@@ -752,6 +752,9 @@ func TestSanitizeMetricName(t *testing.T) {
 }
 
 func TestKeysReset(t *testing.T) {
+	ts := httptest.NewServer(promhttp.Handler())
+	defer ts.Close()
+
 	e, _ := NewRedisExporter(defaultRedisHost, "test", dbNumStrFull+"="+keys[0])
 
 	setupDBKeys(t, defaultRedisHost.Addrs[0])
@@ -759,13 +762,13 @@ func TestKeysReset(t *testing.T) {
 
 	prometheus.Register(e)
 
-	chM := make(chan prometheus.Metric)
+	chM := make(chan prometheus.Metric, 10000)
 	go func() {
 		e.Collect(chM)
 		close(chM)
 	}()
 
-	body := getMetrics(t)
+	body := downloadUrl(t, ts.URL+"/metrics")
 
 	if !bytes.Contains(body, []byte(keys[0])) {
 		t.Errorf("Did not found key %q\n%s", keys[0], body)
@@ -773,14 +776,182 @@ func TestKeysReset(t *testing.T) {
 
 	deleteKeysFromDB(t, defaultRedisHost.Addrs[0])
 
-	body = getMetrics(t)
+	body = downloadUrl(t, ts.URL+"/metrics")
 
 	if bytes.Contains(body, []byte(keys[0])) {
 		t.Errorf("Metric is present in metrics list %q\n%s", keys[0], body)
 	}
 }
 
+func TestClusterMaster(t *testing.T) {
+	if os.Getenv("TEST_REDIS_CLUSTER_MASTER_URI") == "" {
+		log.Println("TEST_REDIS_CLUSTER_MASTER_URI not set - skipping")
+		t.SkipNow()
+		return
+	}
+
+	ts := httptest.NewServer(promhttp.Handler())
+	defer ts.Close()
+
+	addr := "redis://" + os.Getenv("TEST_REDIS_CLUSTER_MASTER_URI")
+	host := RedisHost{Addrs: []string{addr}, Aliases: []string{"master"}}
+	e, _ := NewRedisExporter(host, "test", "")
+
+	setupDBKeys(t, defaultRedisHost.Addrs[0])
+	defer deleteKeysFromDB(t, defaultRedisHost.Addrs[0])
+	log.Println("wut")
+	prometheus.Register(e)
+
+	chM := make(chan prometheus.Metric, 10000)
+	go func() {
+		e.Collect(chM)
+		close(chM)
+	}()
+
+	body := downloadUrl(t, ts.URL+"/metrics")
+	if !bytes.Contains(body, []byte("test_instance_info")) {
+		t.Errorf("Did not found key %q\n%s", keys[0], body)
+	}
+}
+
+func TestPasswordProtectedInstance(t *testing.T) {
+	ts := httptest.NewServer(promhttp.Handler())
+	defer ts.Close()
+
+	testPwd := "p4$$w0rd"
+	host := defaultRedisHost
+	host.Passwords = []string{testPwd}
+
+	setupDBKeys(t, host.Addrs[0])
+
+	// set password for redis instance
+	c, err := redis.DialURL(host.Addrs[0])
+	if err != nil {
+		t.Errorf("couldn't setup redis, err: %s ", err)
+		return
+	}
+	defer c.Close()
+
+	if _, err = c.Do("CONFIG", "SET", "requirepass", testPwd); err != nil {
+		t.Fatalf("error setting password, err: %s", err)
+	}
+	c.Flush()
+
+	defer func() {
+		if _, err = c.Do("auth", testPwd); err != nil {
+			t.Fatalf("error unsetting password, err: %s", err)
+		}
+		if _, err = c.Do("CONFIG", "SET", "requirepass", ""); err != nil {
+			t.Fatalf("error unsetting password, err: %s", err)
+		}
+		deleteKeysFromDB(t, host.Addrs[0])
+	}()
+	e, _ := NewRedisExporter(host, "test", "")
+
+	prometheus.Register(e)
+
+	chM := make(chan prometheus.Metric, 10000)
+	go func() {
+		e.Collect(chM)
+		close(chM)
+	}()
+
+	body := downloadUrl(t, ts.URL+"/metrics")
+
+	if !bytes.Contains(body, []byte("test_up")) {
+		t.Errorf("error")
+	}
+}
+
+func TestPasswordInvalid(t *testing.T) {
+	ts := httptest.NewServer(promhttp.Handler())
+	defer ts.Close()
+
+	testPwd := "p4$$w0rd"
+	host := defaultRedisHost
+	host.Passwords = []string{"wrong_password"}
+
+	setupDBKeys(t, host.Addrs[0])
+
+	// set password for redis instance
+	c, err := redis.DialURL(host.Addrs[0])
+	if err != nil {
+		t.Errorf("couldn't setup redis, err: %s ", err)
+		return
+	}
+	defer c.Close()
+
+	if _, err = c.Do("CONFIG", "SET", "requirepass", testPwd); err != nil {
+		t.Fatalf("error setting password, err: %s", err)
+	}
+	c.Flush()
+
+	defer func() {
+		if _, err = c.Do("auth", testPwd); err != nil {
+			t.Fatalf("error unsetting password, err: %s", err)
+		}
+		if _, err = c.Do("CONFIG", "SET", "requirepass", ""); err != nil {
+			t.Fatalf("error unsetting password, err: %s", err)
+		}
+		deleteKeysFromDB(t, host.Addrs[0])
+	}()
+	e, _ := NewRedisExporter(host, "test", "")
+
+	prometheus.Register(e)
+
+	chM := make(chan prometheus.Metric, 10000)
+	go func() {
+		e.Collect(chM)
+		close(chM)
+	}()
+
+	body := downloadUrl(t, ts.URL+"/metrics")
+	log.Println(string(body))
+	if !bytes.Contains(body, []byte("test_exporter_last_scrape_error 1")) {
+		t.Errorf(`error, expected string "test_exporter_last_scrape_error 1" in body`)
+	}
+}
+
+func TestClusterSlave(t *testing.T) {
+	if os.Getenv("TEST_REDIS_CLUSTER_SLAVE_URI") == "" {
+		log.Println("TEST_REDIS_CLUSTER_SLAVE_URI not set - skipping")
+		t.SkipNow()
+		return
+	}
+
+	ts := httptest.NewServer(promhttp.Handler())
+	defer ts.Close()
+
+	addr := "redis://" + os.Getenv("TEST_REDIS_CLUSTER_SLAVE_URI")
+	host := RedisHost{Addrs: []string{addr}, Aliases: []string{"slave"}}
+	e, _ := NewRedisExporter(host, "test", "")
+
+	setupDBKeys(t, defaultRedisHost.Addrs[0])
+	defer deleteKeysFromDB(t, defaultRedisHost.Addrs[0])
+	log.Println("wut")
+	prometheus.Register(e)
+
+	chM := make(chan prometheus.Metric, 10000)
+	go func() {
+		e.Collect(chM)
+		close(chM)
+	}()
+
+	body := downloadUrl(t, ts.URL+"/metrics")
+	if !bytes.Contains(body, []byte("test_instance_info")) {
+		t.Errorf("Did not found key %q\n%s", keys[0], body)
+	}
+}
+
 func init() {
+	ll := strings.ToLower(os.Getenv("LOG_LEVEL"))
+	if pl, err := log.ParseLevel(ll); err == nil {
+		log.Printf("Setting log level to: %s", ll)
+		log.SetLevel(pl)
+	} else {
+		log.SetLevel(log.InfoLevel)
+	}
+
 	for _, n := range []string{"john", "paul", "ringo", "george"} {
 		key := fmt.Sprintf("key_%s_%d", n, ts)
 		keys = append(keys, key)
@@ -807,7 +978,4 @@ func init() {
 
 	log.Printf("Using redis addrs: %#v", addrs)
 	defaultRedisHost = RedisHost{Addrs: []string{"redis://" + *redisAddr}, Aliases: aliases}
-
-	http.Handle("/metrics", prometheus.Handler())
-	go http.ListenAndServe("127.0.0.1:9121", nil)
 }
