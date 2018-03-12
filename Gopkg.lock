@@ -41,6 +41,12 @@
   revision = "06020f85339e21b2478f756a78e295255ffa4d6a"
 
 [[projects]]
+  name = "github.com/oliver006/redis_exporter"
+  packages = ["exporter"]
+  revision = "a0d9e4c704b4d35cd08544d395038f417716a03a"
+  version = "v0.15.0"
+
+[[projects]]
   name = "github.com/prometheus/client_golang"
   packages = [
     "prometheus",
@@ -104,6 +110,6 @@
 [solve-meta]
   analyzer-name = "dep"
   analyzer-version = 1
-  inputs-digest = "64bcf02f7a4bee555d0391b42f0d1c2e7f614ab7bd691a737bb3f81a99a9c2b0"
+  inputs-digest = "83844676038b30990b33b835b7f64f7b44cc7911b55047bbaa19ae0a0cb76614"
   solver-name = "gps-cdcl"
   solver-version = 1
